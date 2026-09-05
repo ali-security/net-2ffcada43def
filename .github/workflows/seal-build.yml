@@ -1,0 +1,118 @@
+# Authored by Seal: golang.org/x/net ships no GitHub Actions CI (upstream is
+# tested by Go's own builders), so this workflow reproduces the project's own
+# build and test commands -- `go build ./...` and `go test ./...` -- and packs
+# the published module zip with golang.org/x/mod/zip.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: Space-separated Go test names to run instead of the full suite
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  MODULE_PATH: golang.org/x/net
+  MODULE_VERSION: v0.45.0
+  # The registry time machine is not resolvable from GitHub-hosted runners; the
+  # checked-in go.sum pins every dependency by hash, so the public proxy
+  # resolves the same versions the release built against.
+  GOPROXY: https://proxy.golang.org,direct
+  # GOSUMDB stays at its default: the zip helper's x/mod dependency pulls a
+  # toolchain, and toolchain downloads are refused when the checksum database
+  # is disabled.
+  GOTOOLCHAIN: auto
+
+jobs:
+  build:
+    name: build-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: false
+
+      - name: Report toolchain
+        run: go version
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        shell: bash
+        run: |
+          filter='${{ inputs.test-filter }}'
+          if [ -n "$filter" ]; then
+            # anchor ^(...)$ so "TestFoo" matches exactly, not TestFooBar
+            go test -v -run "^($(echo "$filter" | tr ' ' '|'))$" ./... 2>&1 | tee /tmp/scoped.log
+            # fail closed: every selected test must log its own `=== RUN` line
+            for t in $filter; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" /tmp/scoped.log || {
+                echo "selected test $t never ran"; exit 1;
+              }
+            done
+          else
+            go test ./...
+          fi
+
+      - name: Pack module zip
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/ziphelper" "$RUNNER_TEMP/build_output"
+          # The published module zip carries no .github members (upstream ships
+          # no CI), so pack from a copy with this authored workflow removed.
+          tar -c --exclude=./.git --exclude=./.github . | tar -x -C "$RUNNER_TEMP/modsrc"
+          cd "$RUNNER_TEMP/ziphelper"
+          # Space-indented on purpose: the fork's YAML round-trip strips the
+          # block-scalar indent from any line that also carries a tab.
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              if len(os.Args) != 5 {
+                  log.Fatal("usage: modzip <module-path> <version> <source-dir> <output-zip>")
+              }
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          go mod init seal.example/modzip
+          go get golang.org/x/mod
+          go run . "$MODULE_PATH" "$MODULE_VERSION" "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/build_output/$MODULE_VERSION.zip"
+          unzip -l "$RUNNER_TEMP/build_output/$MODULE_VERSION.zip" | tail -5
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/build_output/v0.45.0.zip
+          if-no-files-found: error
